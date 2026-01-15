@@ -178,8 +178,13 @@ class IdentityManager:
 
     def resolve_identity(self, frame, yolo_id, keypoints, person_box):
         # 1. Fast Path: Session Cache
+        # Only return immediately if we have a REAL identity (PID < 1000)
+        # If we have a Temp identity (PID >= 1000), we should keep trying to get a face
         if yolo_id in self.session_map:
-            return self.session_map[yolo_id]
+            cached_pid = self.session_map[yolo_id]
+            if cached_pid < 1000:
+                return cached_pid
+            # If cached_pid >= 1000, it's temporary. Fall through to try Face Rec again.
             
         # 2. Slow Path: Face Recognition
         encoding, face_crop = self.get_face_encoding_and_crop(frame, keypoints, person_box)
@@ -233,9 +238,15 @@ class IdentityManager:
                 self.database.append(new_record)
                 self.session_map[yolo_id] = new_pid
                 self.save_database() 
+                print(f"[SYSTEM] Registered New Identity: PID {new_pid}")
                 return new_pid
         
         # 3. Fallback: Temporary Session ID
+        # If we failed to get a face, and we already have a temp ID, return it.
+        if yolo_id in self.session_map:
+             return self.session_map[yolo_id]
+             
+        # Otherwise assign new temp
         temp_pid = 1000 + yolo_id 
         self.session_map[yolo_id] = temp_pid
         return temp_pid
