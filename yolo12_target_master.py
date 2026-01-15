@@ -154,11 +154,15 @@ class IdentityManager:
                     # Limit encodings to 50 for performance
                     if len(record['encodings']) < 50:
                         record['encodings'].append(encoding)
-                        # Also save the image if we have space (e.g. limit to 10 representative images)
-                        if 'images' not in record:
-                            record['images'] = []
-                        if len(record['images']) < 10:
-                            record['images'].append(face_crop)
+                        
+                        # Save Image to Disk
+                        if 'image_paths' not in record:
+                            record['image_paths'] = []
+                            
+                        if len(record['image_paths']) < 10:
+                            filename = f"data/faces/images/pid_{best_match_pid}_{int(time.time()*1000)}.jpg"
+                            cv2.imwrite(filename, face_crop)
+                            record['image_paths'].append(filename)
                             
                         self.save_database() # Auto-save on update
                     break
@@ -171,11 +175,15 @@ class IdentityManager:
                 new_pid = self.next_pid
                 self.next_pid += 1
                 
+                # Save Image to Disk
+                filename = f"data/faces/images/pid_{new_pid}_{int(time.time()*1000)}.jpg"
+                cv2.imwrite(filename, face_crop)
+                
                 # Create record
                 new_record = {
                     'pid': new_pid, 
                     'encodings': [encoding], 
-                    'images': [face_crop], # Store the cropped face image
+                    'image_paths': [filename], # Store path, not raw image
                     'created_at': time.time()
                 }
                 
