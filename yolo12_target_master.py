@@ -1,7 +1,13 @@
 import cv2
 import numpy as np
 import time
-from ultralytics import YOLO
+try:
+    from ultralytics import YOLO
+except ImportError:
+    print("\n[ERROR] 'ultralytics' library not found.")
+    print("Please run: pip install ultralytics")
+    print("Then try running this script again.\n")
+    exit(1)
 
 # --- CONFIGURATION ---
 SAFE_ZONES = [
