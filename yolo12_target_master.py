@@ -25,7 +25,7 @@ TURRET_LIMITS = {
 }
 
 AIM_MODES = {
-    1: "HEAD",
+    1: "HEAD (Forehead)",
     2: "UPPER_BODY",
     3: "NON_LETHAL"
 }
@@ -95,6 +95,10 @@ class TargetManager:
         self.locked_ids = set()
         self.primary_target = None
         
+        # Manual Override
+        self.manual_mode = False
+        self.selected_id = None
+        
     def is_safe(self, box):
         """
         Check if target is in a Safe Zone (Ignore Zone).
@@ -153,16 +157,37 @@ class TargetManager:
                 def is_valid(kp_idx):
                     return kps.shape[0] > kp_idx and kps[kp_idx][0] != 0 and kps[kp_idx][1] != 0
 
-                if aim_mode == 1: # HEAD
-                    if is_valid(0): # Nose
-                        aim_x, aim_y = kps[0]
-                    elif is_valid(1) and is_valid(2): # Midpoint Eyes
-                        aim_x = (kps[1][0] + kps[2][0]) / 2
-                        aim_y = (kps[1][1] + kps[2][1]) / 2
-                    else:
-                        # Fallback
+                if aim_mode == 1: # HEAD (Precise Forehead)
+                    # Use Eyes (1, 2) and Nose (0) to vector to Forehead
+                    if is_valid(1) and is_valid(2): # Both Eyes
+                        mid_x = (kps[1][0] + kps[2][0]) / 2
+                        mid_y = (kps[1][1] + kps[2][1]) / 2
+                        
+                        if is_valid(0): # Nose available for vector
+                            # Vector from Nose to EyeMid
+                            vec_x = mid_x - kps[0][0]
+                            vec_y = mid_y - kps[0][1]
+                            
+                            # Forehead is roughly same distance above eyes
+                            # Scaling factor 1.2 to hit forehead center
+                            aim_x = mid_x + (vec_x * 1.2)
+                            aim_y = mid_y + (vec_y * 1.2)
+                        else:
+                            # Use eye distance as scale
+                            eye_dist = np.sqrt((kps[1][0] - kps[2][0])**2 + (kps[1][1] - kps[2][1])**2)
+                            aim_x = mid_x
+                            # Move up (negative Y) by approx 0.8 * eye_dist
+                            aim_y = mid_y - (eye_dist * 0.8)
+                            
+                    elif is_valid(0): # Only Nose
+                        # Go up from nose by approx 1/6 of face height (estimated from box)
                         h = y2 - y1
-                        aim_y = y1 + (h * 0.12)
+                        aim_x = kps[0][0]
+                        aim_y = kps[0][1] - (h * 0.15) # Approx forehead from nose
+                    else:
+                        # Fallback Box
+                        h = y2 - y1
+                        aim_y = y1 + (h * 0.08) # Top 8%
 
                 elif aim_mode == 3: # NON_LETHAL (Legs)
                     if is_valid(13) and is_valid(14): # Knees Midpoint
@@ -200,19 +225,32 @@ class TargetManager:
             }
             valid_targets.append(target_data)
 
-        # --- 2. Select Primary (Strategy: Closest to Center) ---
-        best_dist = float('inf')
+        # --- 2. Select Primary ---
         best_t_data = None
         
-        for t in valid_targets:
-            if t['dist_to_center'] < best_dist:
-                best_dist = t['dist_to_center']
-                best_t_data = t
+        if self.manual_mode and self.selected_id is not None:
+            # Find the selected ID
+            for t in valid_targets:
+                if t['id'] == self.selected_id:
+                    best_t_data = t
+                    break
+            # If selected ID not found (left frame), keep best_t_data None
+            # or maybe switch back to auto? For now, stay locked on nothing until it returns or user switches.
+        else:
+            # Auto Mode: Closest to Center
+            best_dist = float('inf')
+            for t in valid_targets:
+                if t['dist_to_center'] < best_dist:
+                    best_dist = t['dist_to_center']
+                    best_t_data = t
         
         # --- 3. Update State ---
         if best_t_data:
             self.primary_target = best_t_data
             self.locked_ids.add(best_t_data['id'])
+            # If in manual mode, ensure selected_id matches (in case we just switched)
+            if self.manual_mode and self.selected_id is None:
+                self.selected_id = best_t_data['id']
         else:
             self.primary_target = None
 
@@ -223,7 +261,7 @@ class TargetManager:
                 
         return valid_targets
 
-def draw_hud(frame, turret, targets, primary, aim_mode_idx):
+def draw_hud(frame, turret, targets, primary, aim_mode_idx, manager):
     H, W = frame.shape[:2]
     cx, cy = W // 2, H // 2
     
@@ -267,7 +305,7 @@ def draw_hud(frame, turret, targets, primary, aim_mode_idx):
         cv2.circle(frame, (ax, ay), 4, (0, 0, 255), -1)
 
     # --- 4. System Info Panel ---
-    panel_w, panel_h = 240, 180 
+    panel_w, panel_h = 240, 260 # Increased height for Target List
     panel_x = W - panel_w - 10
     panel_y = 10
     
@@ -289,14 +327,42 @@ def draw_hud(frame, turret, targets, primary, aim_mode_idx):
     sy += line_h
     
     mode_str = AIM_MODES.get(aim_mode_idx, "UNKNOWN")
-    cv2.putText(frame, f"MODE      : {mode_str}", (sx, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
+    cv2.putText(frame, f"AIM MODE  : {mode_str}", (sx, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
+    sy += line_h
+
+    # Track Mode (Auto/Manual)
+    trk_mode = "MANUAL LOCK" if manager.manual_mode else "AUTO (CLOSEST)"
+    color_trk = (0, 0, 255) if manager.manual_mode else (0, 255, 0)
+    cv2.putText(frame, f"TRK LOGIC : {trk_mode}", (sx, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_trk, 1)
     sy += line_h
 
     status = "ENGAGED" if primary else "SCANNING"
     cv2.putText(frame, f"STATUS    : {status}", (sx, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255) if primary else (0, 255, 0), 1)
     sy += line_h
     
-    cv2.putText(frame, f"TARGETS   : {len(targets)}", (sx, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    cv2.line(frame, (sx, sy), (sx+200, sy), (50, 50, 50), 1)
+    sy += 15
+    cv2.putText(frame, "ENGAGEMENT PANEL", (sx, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    sy += 15
+    
+    # List IDs
+    # Sort targets by ID for stable list
+    sorted_targets = sorted(targets, key=lambda x: x['id'])
+    for i, t in enumerate(sorted_targets):
+        if i > 3: # Limit to 4 lines
+            cv2.putText(frame, f"... (+{len(targets)-4})", (sx, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+            break
+            
+        tid = t['id']
+        dist = int(t['dist_to_center'])
+        is_sel = (t == primary)
+        
+        prefix = ">" if is_sel else " "
+        color_t = (0, 255, 0) if is_sel else (150, 150, 150)
+        
+        text = f"{prefix} ID:{tid} [Dist:{dist}]"
+        cv2.putText(frame, text, (sx, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_t, 1)
+        sy += line_h
 
 def main():
     print("[SYSTEM] Initializing Safe Turret System...")
@@ -328,7 +394,8 @@ def main():
     
     print(f"[SYSTEM] Cam: {W}x{H}")
     print("[SYSTEM] Mode: PRECISE POSE TRACKING")
-    print("[CONTROL] Keys: '1'=Head, '2'=Upper Body, '3'=Non-Lethal (Legs)")
+    print("[CONTROL] Keys: '1'=Head, '2'=Upper Body, '3'=Non-Lethal")
+    print("[CONTROL] Keys: 'm'=Toggle Manual/Auto, 'TAB'=Cycle Targets")
 
     while True:
         ret, frame = cap.read()
@@ -358,7 +425,7 @@ def main():
             turret.update(error_x, error_y)
         
         # --- RENDER ---
-        draw_hud(frame, turret, targets, primary, aim_mode)
+        draw_hud(frame, turret, targets, primary, aim_mode, manager)
 
         cv2.imshow("Safe Turret Sim", frame)
         
@@ -372,6 +439,25 @@ def main():
             aim_mode = 2
         elif key == ord('3'):
             aim_mode = 3
+        elif key == ord('m'):
+            manager.manual_mode = not manager.manual_mode
+            print(f"[SYSTEM] Manual Mode: {manager.manual_mode}")
+            # If switching to Manual, lock onto current primary (if any)
+            if manager.manual_mode and manager.primary_target:
+                manager.selected_id = manager.primary_target['id']
+            elif not manager.manual_mode:
+                manager.selected_id = None
+        elif key == 9: # TAB Key (ASCII 9)
+            if manager.manual_mode and len(targets) > 0:
+                # Cycle ID
+                # Get list of IDs
+                ids = sorted([t['id'] for t in targets])
+                if manager.selected_id in ids:
+                    idx = ids.index(manager.selected_id)
+                    next_idx = (idx + 1) % len(ids)
+                    manager.selected_id = ids[next_idx]
+                else:
+                    manager.selected_id = ids[0]
 
     cap.release()
     cv2.destroyAllWindows()
