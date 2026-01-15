@@ -59,6 +59,10 @@ class IdentityManager:
         # Cache: Map YOLO_ID (current session) -> Persistent_ID
         self.session_map = {}
         
+        # Ensure directories exist
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        os.makedirs("data/faces/images", exist_ok=True)
+        
         self.load_database()
 
     def load_database(self):
@@ -494,6 +498,12 @@ def draw_hud(frame, turret, targets, primary, aim_mode_idx, manager):
     
     db_count = len(manager.identity_manager.database)
     cv2.putText(frame, f"DB SIZE: {db_count} Identities", (sx, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+    sy += line_h
+    
+    # Face Rec Status
+    fr_status = "ACTIVE" if FACE_REC_AVAILABLE else "OFFLINE"
+    color_fr = (0, 255, 0) if FACE_REC_AVAILABLE else (0, 0, 255)
+    cv2.putText(frame, f"FACE REC: {fr_status}", (sx, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_fr, 1)
     sy += line_h
 
     status = "ENGAGED" if primary else "SCANNING"
