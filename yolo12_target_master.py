@@ -99,9 +99,9 @@ class IdentityManager:
         # 1. Estimate Face ROI
         face_x1, face_y1, face_x2, face_y2 = px1, py1, px2, py1 # Init
         
-        # Check Keypoints (Eyes, Nose)
+        # Check Keypoints (Eyes, Nose, Ears)
         face_pts = []
-        for i in [0, 1, 2]: # Nose, LEye, REye
+        for i in [0, 1, 2, 3, 4]: # Nose, LEye, REye, LEar, REar
             if len(kps) > i and kps[i][0] != 0:
                 face_pts.append(kps[i])
                 
@@ -111,8 +111,11 @@ class IdentityManager:
             min_x, min_y = np.min(pts, axis=0)
             max_x, max_y = np.max(pts, axis=0)
             
-            # Width based on eye/feature spread or person width
-            f_w = max(max_x - min_x, (px2 - px1) * 0.3) 
+            # Width based on feature spread
+            f_w = max_x - min_x
+            # Ensure minimum width relative to person (e.g. at least 20% of person width)
+            f_w = max(f_w, (px2 - px1) * 0.2)
+            
             # Height roughly 1.5x width
             f_h = f_w * 1.5
             
@@ -120,8 +123,8 @@ class IdentityManager:
             c_x = (min_x + max_x) / 2
             c_y = (min_y + max_y) / 2
             
-            # Pad
-            pad = 0.5 
+            # Pad GENEROUSLY (1.0 = 100% padding) to ensure HOG detector has context
+            pad = 1.0 
             half_w = (f_w * (1 + pad)) / 2
             half_h = (f_h * (1 + pad)) / 2
             
@@ -130,14 +133,16 @@ class IdentityManager:
             face_y1 = int(c_y - half_h)
             face_y2 = int(c_y + half_h)
         else:
-            # Fallback: Top 20-25% of Person Box (Heuristic)
+            # Fallback: Top 25% of Person Box (Heuristic), Full Width
             p_w = px2 - px1
             p_h = py2 - py1
             
-            face_x1 = int(px1 + (p_w * 0.2)) # Indent 20%
-            face_x2 = int(px2 - (p_w * 0.2))
+            # Don't indent sides too much, maybe just 5%
+            face_x1 = int(px1 + (p_w * 0.05)) 
+            face_x2 = int(px2 - (p_w * 0.05))
             face_y1 = int(py1)
-            face_y2 = int(py1 + (p_h * 0.25))
+            # Take top 20% or at least 150px
+            face_y2 = int(py1 + max(p_h * 0.2, 150))
             
         # Clip to Frame
         face_x1 = max(0, face_x1)
@@ -163,7 +168,6 @@ class IdentityManager:
             
             # Use the largest face found in crop
             # box is (top, right, bottom, left)
-            # We want the one with largest area
             best_box = max(boxes, key=lambda b: (b[2]-b[0]) * (b[1]-b[3]))
             
             # Encode specifically that face
@@ -191,7 +195,7 @@ class IdentityManager:
         if encoding is not None:
             best_match_pid = None
             min_dist = 1.0 # Start high (0.0 is exact match)
-            tolerance = 0.50 # Strict tolerance
+            tolerance = 0.55 # Slightly relaxed tolerance (default 0.6)
             
             best_record = None
             
@@ -199,6 +203,8 @@ class IdentityManager:
             for record in self.database:
                 # face_distance returns array of distances to all encodings in the list
                 dists = face_recognition.face_distance(record['encodings'], encoding)
+                if len(dists) == 0: continue
+                
                 score = np.min(dists) # Best score for this person
                 
                 if score < min_dist:
