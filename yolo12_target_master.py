@@ -47,12 +47,12 @@ DB_PATH = "data/faces/identity_db.pkl"
 class IdentityManager:
     def __init__(self):
         # Database Schema: 
-        # { 'pid': int, 'encodings': [list of encodings], 'last_seen': timestamp }
+        # { 'pid': int, 'encodings': [list of encodings], 'images': [list of face crops], 'last_seen': timestamp }
         self.database = [] 
         self.next_pid = 1
         
         # Cache: Map YOLO_ID (current session) -> Persistent_ID
-        self.session_map = {} 
+        self.session_map = {}
         
         self.load_database()
 
@@ -83,9 +83,9 @@ class IdentityManager:
         except Exception as e:
             print(f"[ERROR] Failed to save database: {e}")
 
-    def get_face_encoding(self, frame, kps):
+    def get_face_encoding_and_crop(self, frame, kps):
         if not FACE_REC_AVAILABLE:
-            return None
+            return None, None
 
         face_pts = []
         for i in [0, 1, 2, 3, 4]:
@@ -93,7 +93,7 @@ class IdentityManager:
                 face_pts.append(kps[i])
         
         if len(face_pts) < 3:
-            return None 
+            return None, None 
 
         face_pts = np.array(face_pts)
         x_min, y_min = np.min(face_pts, axis=0)
@@ -112,7 +112,7 @@ class IdentityManager:
         
         face_crop = frame[y1:y2, x1:x2]
         if face_crop.size == 0:
-            return None
+            return None, None
             
         rgb_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
         
@@ -122,10 +122,11 @@ class IdentityManager:
             
             encodings = face_recognition.face_encodings(rgb_crop, known_face_locations=known_loc)
             if encodings:
-                return encodings[0]
+                # Return the original BGR crop (for storage/display) and the encoding
+                return encodings[0], face_crop
         except Exception:
             pass
-        return None
+        return None, None
 
     def resolve_identity(self, frame, yolo_id, keypoints):
         # 1. Fast Path: Session Cache
@@ -133,7 +134,7 @@ class IdentityManager:
             return self.session_map[yolo_id]
             
         # 2. Slow Path: Face Recognition
-        encoding = self.get_face_encoding(frame, keypoints)
+        encoding, face_crop = self.get_face_encoding_and_crop(frame, keypoints)
         
         if encoding is not None:
             best_match_pid = None
@@ -143,9 +144,17 @@ class IdentityManager:
                 matches = face_recognition.compare_faces(record['encodings'], encoding, tolerance=0.6)
                 if True in matches:
                     best_match_pid = record['pid']
-                    # Add new sample to robustness (limit to 50 samples)
+                    
+                    # Update Existing Record
+                    # Limit encodings to 50 for performance
                     if len(record['encodings']) < 50:
                         record['encodings'].append(encoding)
+                        # Also save the image if we have space (e.g. limit to 10 representative images)
+                        if 'images' not in record:
+                            record['images'] = []
+                        if len(record['images']) < 10:
+                            record['images'].append(face_crop)
+                            
                         self.save_database() # Auto-save on update
                     break
             
@@ -157,9 +166,15 @@ class IdentityManager:
                 new_pid = self.next_pid
                 self.next_pid += 1
                 
-                # Save first face image (Optional: Save to disk for debug)
-                # For now just storing encoding
-                self.database.append({'pid': new_pid, 'encodings': [encoding], 'created_at': time.time()})
+                # Create record
+                new_record = {
+                    'pid': new_pid, 
+                    'encodings': [encoding], 
+                    'images': [face_crop], # Store the cropped face image
+                    'created_at': time.time()
+                }
+                
+                self.database.append(new_record)
                 self.session_map[yolo_id] = new_pid
                 self.save_database() # Auto-save on creation
                 return new_pid
