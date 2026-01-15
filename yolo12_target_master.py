@@ -24,6 +24,12 @@ TURRET_LIMITS = {
     'TILT_RANGE': (-45, 45)
 }
 
+AIM_MODES = {
+    1: "HEAD",
+    2: "UPPER_BODY",
+    3: "NON_LETHAL"
+}
+
 class TurretController:
     """
     Simulates a 2-axis gimbal/turret with PID control.
@@ -172,7 +178,7 @@ class TargetManager:
                 
         return formatted_targets
 
-def draw_hud(frame, turret, targets, primary):
+def draw_hud(frame, turret, targets, primary, aim_mode_idx):
     H, W = frame.shape[:2]
     cx, cy = W // 2, H // 2
     
@@ -216,7 +222,7 @@ def draw_hud(frame, turret, targets, primary):
 
     # --- 4. System Info Panel ---
     # Background
-    panel_w, panel_h = 240, 160
+    panel_w, panel_h = 240, 180 # Increased height for MODE
     panel_x = W - panel_w - 10
     panel_y = 10
     
@@ -238,6 +244,10 @@ def draw_hud(frame, turret, targets, primary):
     cv2.putText(frame, f"TILT ANGLE: {turret.tilt_angle:+.1f}", (sx, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
     sy += line_h
     
+    mode_str = AIM_MODES.get(aim_mode_idx, "UNKNOWN")
+    cv2.putText(frame, f"MODE      : {mode_str}", (sx, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
+    sy += line_h
+
     status = "ENGAGED" if primary else "SCANNING"
     cv2.putText(frame, f"STATUS    : {status}", (sx, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255) if primary else (0, 255, 0), 1)
     sy += line_h
@@ -271,8 +281,11 @@ def main():
     turret = TurretController(kp=0.1, ki=0.01, kd=0.05)
     manager = TargetManager(W, H)
     
+    aim_mode = 2 # Default: UPPER_BODY
+    
     print(f"[SYSTEM] Cam: {W}x{H}")
     print("[SYSTEM] Mode: SAFE HUMAN TRACKING (PASSIVE)")
+    print("[CONTROL] Keys: '1'=Head, '2'=Upper Body, '3'=Non-Lethal (Legs)")
 
     while True:
         ret, frame = cap.read()
@@ -293,21 +306,54 @@ def main():
 
         # --- TURRET PID UPDATE ---
         if primary:
-            # Error = Target Center - Frame Center
-            error_x = primary['center'][0] - (W // 2)
-            error_y = primary['center'][1] - (H // 2)
+            # Calculate Aim Point based on Mode
+            x1, y1, x2, y2 = primary['box']
+            h = y2 - y1
+            
+            # Default Center X
+            # (If we wanted to target left/right arm, we'd adjust X too)
+            target_x = primary['center'][0]
+            
+            # Adjust Y based on Priority Mode
+            if aim_mode == 1: # HEAD
+                # Head is roughly top 15%
+                target_y = y1 + (h * 0.12)
+            elif aim_mode == 3: # NON_LETHAL (Legs/Lower)
+                # Lower body/Legs roughly bottom 25%
+                target_y = y1 + (h * 0.75)
+            else: # 2 or default: UPPER_BODY
+                # Upper Chest/Torso roughly 35% down
+                target_y = y1 + (h * 0.35)
+
+            # Error = Target Point - Frame Center
+            error_x = target_x - (W // 2)
+            error_y = target_y - (H // 2)
             turret.update(error_x, error_y)
+            
+            # Visualize Tracking Point (The Red Dot)
+            cv2.circle(frame, (int(target_x), int(target_y)), 6, (0, 0, 255), -1)
+            cv2.circle(frame, (int(target_x), int(target_y)), 8, (0, 255, 255), 1)
+
         else:
             # If no target, maybe drift back to 0? Or just stay.
             # turret.update(0, 0) # Uncomment to auto-center when idle
             pass
 
         # --- RENDER ---
-        draw_hud(frame, turret, targets, primary)
+        draw_hud(frame, turret, targets, primary, aim_mode)
 
         cv2.imshow("Safe Turret Sim", frame)
-        if cv2.waitKey(1) == ord('q'): 
+        
+        # Input Handling
+        key = cv2.waitKey(1)
+        if key == ord('q'): 
             break
+        elif key == ord('1'):
+            aim_mode = 1
+        elif key == ord('2'):
+            aim_mode = 2
+        elif key == ord('3'):
+            aim_mode = 3
 
     cap.release()
     cv2.destroyAllWindows()
