@@ -3,6 +3,11 @@ import numpy as np
 import time
 import os
 import pickle
+import warnings
+
+# Suppress DeprecationWarning from face_recognition_models
+warnings.filterwarnings("ignore", category=UserWarning, module='face_recognition_models')
+
 try:
     from ultralytics import YOLO
 except ImportError:
@@ -248,7 +253,7 @@ class TargetManager:
         for i, box in enumerate(boxes):
             if int(box.cls[0]) != 0: continue 
             xyxy = box.xyxy[0].cpu().numpy()
-            if self.is_safe(xyxy): continue
+            is_target_safe = self.is_safe(xyxy)
             
             yolo_id = int(box.id[0]) if box.id is not None else -1
             
@@ -302,7 +307,8 @@ class TargetManager:
                 'box': (x1, y1, x2, y2),
                 'aim_point': (int(aim_x), int(aim_y)),
                 'dist_to_center': np.sqrt(((x1+x2)//2 - self.cx)**2 + ((y1+y2)//2 - self.cy)**2),
-                'locked': False
+                'locked': False,
+                'safe': is_target_safe
             }
             valid_targets.append(target_data)
 
@@ -312,13 +318,19 @@ class TargetManager:
         if self.selected_pid is not None:
             for t in valid_targets:
                 if t['pid'] == self.selected_pid:
+                    # Allow selection even if safe? 
+                    # Let's say yes for manual, but maybe warn?
+                    # For now, yes, allow locking.
                     best_t_data = t
                     break
         
-        # Auto-Fallthrough only if Manual Mode is OFF (Which it isn't by default now)
+        # Auto-Fallthrough only if Manual Mode is OFF
         if best_t_data is None and not self.manual_mode:
             best_dist = float('inf')
             for t in valid_targets:
+                # Ignore Safe targets for AUTO selection
+                if t['safe']: continue
+                
                 if t['dist_to_center'] < best_dist:
                     best_dist = t['dist_to_center']
                     best_t_data = t
@@ -356,16 +368,27 @@ def draw_hud(frame, turret, targets, primary, aim_mode_idx, manager):
     for t in targets:
         x1, y1, x2, y2 = t['box']
         is_engaged = (t == primary)
+        is_safe = t.get('safe', False)
         
-        color = (0, 0, 255) if is_engaged else (0, 255, 255)
+        if is_safe:
+            color = (0, 255, 0) # Green for Safe
+            label_suffix = " (SAFE)"
+        elif is_engaged:
+            color = (0, 0, 255) # Red for Engaged
+            label_suffix = ""
+        else:
+            color = (0, 255, 255) # Yellow for Tracked
+            label_suffix = ""
+            
         thick = 2 if is_engaged else 1
         
         if is_engaged: cv2.line(frame, (cx, cy), t['aim_point'], color, 1)
             
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
-        cv2.putText(frame, f"P-ID:{t['pid']}", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.putText(frame, f"P-ID:{t['pid']}{label_suffix}", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
-        cv2.circle(frame, t['aim_point'], 4, (0, 0, 255), -1)
+        if not is_safe:
+            cv2.circle(frame, t['aim_point'], 4, (0, 0, 255), -1)
 
     panel_w, panel_h = 260, 280
     panel_x, panel_y = W - panel_w - 10, 10
@@ -414,9 +437,20 @@ def draw_hud(frame, turret, targets, primary, aim_mode_idx, manager):
             break
         
         is_sel = (t == primary)
+        is_safe = t.get('safe', False)
         prefix = ">>" if is_sel else "  "
-        color_t = (0, 255, 0) if is_sel else (150, 150, 150)
-        text = f"{prefix} PID:{t['pid']} [Y:{t['yolo_id']}]"
+        
+        if is_safe:
+            color_t = (0, 255, 0)
+            status_txt = "[SAFE]"
+        elif is_sel:
+            color_t = (0, 255, 0)
+            status_txt = "[ENGAGED]"
+        else:
+            color_t = (150, 150, 150)
+            status_txt = ""
+            
+        text = f"{prefix} PID:{t['pid']} {status_txt}"
         cv2.putText(frame, text, (sx, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_t, 1)
         sy += line_h
 
@@ -485,7 +519,7 @@ def main():
              manager.manual_mode = True # Default to Manual when reset (or False? User said default is Manual)
              # User said: "default target mode should be manual"
              # So reset probably just clears selection but keeps manual mode?
-        elif key == 9: #TAB
+        elif key == 9 or key == ord('\t'): #TAB
             if len(targets) > 0:
                 pids = sorted([t['pid'] for t in targets])
                 
