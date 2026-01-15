@@ -88,83 +88,128 @@ class IdentityManager:
         except Exception as e:
             print(f"[ERROR] Failed to save database: {e}")
 
-    def get_face_encoding_and_crop(self, frame, kps):
+    def get_face_encoding_and_crop(self, frame, kps, person_box):
         if not FACE_REC_AVAILABLE:
             return None, None
 
+        # Strategy: Use Person Box as base, refine with Keypoints if available
+        px1, py1, px2, py2 = person_box
+        H, W = frame.shape[:2]
+        
+        # 1. Estimate Face ROI
+        face_x1, face_y1, face_x2, face_y2 = px1, py1, px2, py1 # Init
+        
+        # Check Keypoints (Eyes, Nose)
         face_pts = []
-        for i in [0, 1, 2, 3, 4]:
+        for i in [0, 1, 2]: # Nose, LEye, REye
             if len(kps) > i and kps[i][0] != 0:
                 face_pts.append(kps[i])
-        
-        if len(face_pts) < 3:
-            return None, None 
-
-        face_pts = np.array(face_pts)
-        x_min, y_min = np.min(face_pts, axis=0)
-        x_max, y_max = np.max(face_pts, axis=0)
-        
-        w = x_max - x_min
-        h = y_max - y_min
-        pad_x = int(w * 0.5)
-        pad_y = int(h * 0.5)
-        
-        H, W = frame.shape[:2]
-        x1 = max(0, int(x_min - pad_x))
-        y1 = max(0, int(y_min - pad_y))
-        x2 = min(W, int(x_max + pad_x))
-        y2 = min(H, int(y_max + pad_y))
-        
-        face_crop = frame[y1:y2, x1:x2]
-        if face_crop.size == 0:
-            return None, None
+                
+        if len(face_pts) >= 2:
+            # We have facial features -> Use them to center crop
+            pts = np.array(face_pts)
+            min_x, min_y = np.min(pts, axis=0)
+            max_x, max_y = np.max(pts, axis=0)
             
+            # Width based on eye/feature spread or person width
+            f_w = max(max_x - min_x, (px2 - px1) * 0.3) 
+            # Height roughly 1.5x width
+            f_h = f_w * 1.5
+            
+            # Center
+            c_x = (min_x + max_x) / 2
+            c_y = (min_y + max_y) / 2
+            
+            # Pad
+            pad = 0.5 
+            half_w = (f_w * (1 + pad)) / 2
+            half_h = (f_h * (1 + pad)) / 2
+            
+            face_x1 = int(c_x - half_w)
+            face_x2 = int(c_x + half_w)
+            face_y1 = int(c_y - half_h)
+            face_y2 = int(c_y + half_h)
+        else:
+            # Fallback: Top 20-25% of Person Box (Heuristic)
+            p_w = px2 - px1
+            p_h = py2 - py1
+            
+            face_x1 = int(px1 + (p_w * 0.2)) # Indent 20%
+            face_x2 = int(px2 - (p_w * 0.2))
+            face_y1 = int(py1)
+            face_y2 = int(py1 + (p_h * 0.25))
+            
+        # Clip to Frame
+        face_x1 = max(0, face_x1)
+        face_y1 = max(0, face_y1)
+        face_x2 = min(W, face_x2)
+        face_y2 = min(H, face_y2)
+        
+        if (face_x2 - face_x1) < 20 or (face_y2 - face_y1) < 20:
+             return None, None # Too small
+             
+        # Extract Crop
+        face_crop = frame[face_y1:face_y2, face_x1:face_x2]
         rgb_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
         
         try:
-            h_c, w_c = rgb_crop.shape[:2]
-            known_loc = [(0, w_c, h_c, 0)]
+            # DETECT face in this crop first (don't force location)
+            # This ensures we actually see a face and not just a shirt
+            # upsample=1 for small faces
+            boxes = face_recognition.face_locations(rgb_crop, number_of_times_to_upsample=1)
             
-            encodings = face_recognition.face_encodings(rgb_crop, known_face_locations=known_loc)
+            if not boxes:
+                return None, None
+            
+            # Use the largest face found in crop
+            # box is (top, right, bottom, left)
+            # We want the one with largest area
+            best_box = max(boxes, key=lambda b: (b[2]-b[0]) * (b[1]-b[3]))
+            
+            # Encode specifically that face
+            encodings = face_recognition.face_encodings(rgb_crop, known_face_locations=[best_box])
+            
             if encodings:
-                # Return the original BGR crop (for storage/display) and the encoding
                 return encodings[0], face_crop
         except Exception:
             pass
+            
         return None, None
 
-    def resolve_identity(self, frame, yolo_id, keypoints):
+    def resolve_identity(self, frame, yolo_id, keypoints, person_box):
         # 1. Fast Path: Session Cache
         if yolo_id in self.session_map:
             return self.session_map[yolo_id]
             
         # 2. Slow Path: Face Recognition
-        encoding, face_crop = self.get_face_encoding_and_crop(frame, keypoints)
+        encoding, face_crop = self.get_face_encoding_and_crop(frame, keypoints, person_box)
         
         if encoding is not None:
             best_match_pid = None
             
             # Search Database
+            # Use stricter tolerance (default 0.6 -> 0.5 or 0.45) to avoid "Same ID for everyone"
+            tolerance = 0.5 
+            
             for record in self.database:
-                matches = face_recognition.compare_faces(record['encodings'], encoding, tolerance=0.6)
+                matches = face_recognition.compare_faces(record['encodings'], encoding, tolerance=tolerance)
+                
+                # Check for majority vote or strong match?
+                # Simple boolean match for now
                 if True in matches:
                     best_match_pid = record['pid']
                     
-                    # Update Existing Record
-                    # Limit encodings to 50 for performance
                     if len(record['encodings']) < 50:
                         record['encodings'].append(encoding)
                         
-                        # Save Image to Disk
                         if 'image_paths' not in record:
                             record['image_paths'] = []
-                            
                         if len(record['image_paths']) < 10:
                             filename = f"data/faces/images/pid_{best_match_pid}_{int(time.time()*1000)}.jpg"
                             cv2.imwrite(filename, face_crop)
                             record['image_paths'].append(filename)
-                            
-                        self.save_database() # Auto-save on update
+                        
+                        self.save_database()
                     break
             
             if best_match_pid:
@@ -175,21 +220,19 @@ class IdentityManager:
                 new_pid = self.next_pid
                 self.next_pid += 1
                 
-                # Save Image to Disk
                 filename = f"data/faces/images/pid_{new_pid}_{int(time.time()*1000)}.jpg"
                 cv2.imwrite(filename, face_crop)
                 
-                # Create record
                 new_record = {
                     'pid': new_pid, 
                     'encodings': [encoding], 
-                    'image_paths': [filename], # Store path, not raw image
+                    'image_paths': [filename],
                     'created_at': time.time()
                 }
                 
                 self.database.append(new_record)
                 self.session_map[yolo_id] = new_pid
-                self.save_database() # Auto-save on creation
+                self.save_database() 
                 return new_pid
         
         # 3. Fallback: Temporary Session ID
@@ -267,9 +310,10 @@ class TargetManager:
             
             kps = keypoints[i].xy[0].cpu().numpy() if (keypoints is not None and len(keypoints) > i) else []
             
-            pid = self.identity_manager.resolve_identity(frame, yolo_id, kps)
-            
             x1, y1, x2, y2 = map(int, xyxy)
+            # Pass Person Box for better face crop
+            pid = self.identity_manager.resolve_identity(frame, yolo_id, kps, (x1, y1, x2, y2))
+            
             aim_x, aim_y = (x1 + x2) // 2, (y1 + y2) // 2 
             
             def is_valid(kp_idx):
