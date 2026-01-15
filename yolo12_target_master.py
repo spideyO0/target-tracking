@@ -589,7 +589,7 @@ def main():
 
         cv2.imshow("Safe Turret Sim", frame)
         
-        key = cv2.waitKey(1)
+        key = cv2.waitKey(1) & 0xFF
         if key == ord('q'): 
             break
         elif key == ord('1'): aim_mode = 1
@@ -601,25 +601,19 @@ def main():
                 manager.selected_pid = manager.primary_target['pid']
         elif key == ord('r'):
              manager.selected_pid = None
-             manager.manual_mode = True # Default to Manual when reset (or False? User said default is Manual)
-             # User said: "default target mode should be manual"
-             # So reset probably just clears selection but keeps manual mode?
-        elif key == 9 or key == ord('\t'): #TAB
+             manager.manual_mode = True 
+        elif key == 9: # TAB
             if len(targets) > 0:
                 pids = sorted([t['pid'] for t in targets])
                 
-                # If nothing selected, select first
                 if manager.selected_pid is None:
                      manager.selected_pid = pids[0]
                 elif manager.selected_pid in pids:
-                    # Cycle
                     idx = pids.index(manager.selected_pid)
                     manager.selected_pid = pids[(idx + 1) % len(pids)]
                 else:
-                    # Current selection lost/not in frame, start at 0
                     manager.selected_pid = pids[0]
                 
-                # Cycling implies manual intent
                 manager.manual_mode = True 
 
     cap.release()
