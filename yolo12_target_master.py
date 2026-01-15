@@ -175,7 +175,8 @@ class IdentityManager:
             best_box = max(boxes, key=lambda b: (b[2]-b[0]) * (b[1]-b[3]))
             
             # Encode specifically that face
-            encodings = face_recognition.face_encodings(rgb_crop, known_face_locations=[best_box])
+            # num_jitters=10 resamples the face 10 times to get a robust average encoding
+            encodings = face_recognition.face_encodings(rgb_crop, known_face_locations=[best_box], num_jitters=10)
             
             if encodings:
                 return encodings[0], face_crop
@@ -186,8 +187,6 @@ class IdentityManager:
 
     def resolve_identity(self, frame, yolo_id, keypoints, person_box):
         # 1. Fast Path: Session Cache
-        # Only return immediately if we have a REAL identity (PID < 1000)
-        # If we have a Temp identity (PID >= 1000), we should keep trying to get a face
         if yolo_id in self.session_map:
             cached_pid = self.session_map[yolo_id]
             if cached_pid < 1000:
@@ -198,25 +197,47 @@ class IdentityManager:
         
         if encoding is not None:
             best_match_pid = None
-            min_dist = 1.0 # Start high (0.0 is exact match)
-            tolerance = 0.55 # Slightly relaxed tolerance (default 0.6)
+            min_avg_dist = 1.0 
+            tolerance = 0.55 
             
             best_record = None
             
-            # Search Database for the BEST match, not just the first one
+            # Search Database using Robust Metric (Avg of Top 3 matches)
+            candidates = []
+            
             for record in self.database:
-                # face_distance returns array of distances to all encodings in the list
                 dists = face_recognition.face_distance(record['encodings'], encoding)
                 if len(dists) == 0: continue
                 
-                score = np.min(dists) # Best score for this person
+                # Robustness: Take average of best 3 matches (or all if < 3)
+                # This prevents a single noisy "lucky" match from hijacking identity
+                k = min(len(dists), 3)
+                top_k_dists = np.partition(dists, k-1)[:k]
+                score = np.mean(top_k_dists)
                 
-                if score < min_dist:
-                    min_dist = score
-                    if min_dist < tolerance:
-                        best_match_pid = record['pid']
-                        best_record = record
+                if score < tolerance:
+                    candidates.append((score, record))
             
+            # Sort candidates by score (lower is better)
+            candidates.sort(key=lambda x: x[0])
+            
+            if candidates:
+                best_score, best_rec = candidates[0]
+                
+                # Confusion Check: If we have multiple candidates, ensure best is distinct
+                is_distinct = True
+                if len(candidates) > 1:
+                    second_score = candidates[1][0]
+                    # Margin: Best match must be at least 0.05 better than runner-up
+                    if (second_score - best_score) < 0.05:
+                        is_distinct = False
+                        # print(f"[SYSTEM] Ambiguous identity (Score {best_score:.3f} vs {second_score:.3f}). Skipping.")
+                
+                if is_distinct:
+                    best_match_pid = best_rec['pid']
+                    best_record = best_rec
+                    min_avg_dist = best_score
+
             # Process Result
             if best_match_pid and best_record:
                 # Matched existing
@@ -233,12 +254,13 @@ class IdentityManager:
                         filename = f"data/faces/images/pid_{best_match_pid}_{int(time.time()*1000)}.jpg"
                         cv2.imwrite(filename, face_crop)
                         best_record['image_paths'].append(filename)
-                        print(f"[SYSTEM] Updated PID {best_match_pid} with new face data.")
+                        print(f"[SYSTEM] Updated PID {best_match_pid} with new face data (Score: {min_avg_dist:.3f}).")
                     
                     self.save_database()
                 return best_match_pid
             else:
-                # No match found -> Create New Identity
+                # No robust match found -> Create New Identity
+                # Only create if we are reasonably sure it's a face (jitters helps)
                 new_pid = self.next_pid
                 self.next_pid += 1
                 
