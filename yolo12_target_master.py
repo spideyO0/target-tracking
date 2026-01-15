@@ -111,72 +111,117 @@ class TargetManager:
                 return True # In safe zone
         return False
 
-    def select_targets(self, tracks):
+    def select_targets(self, results, aim_mode):
         """
         Process tracker output, filter unsafe, and select Primary.
+        Accepts full YOLO Results object to access Keypoints.
         """
         valid_targets = []
         
+        boxes = results.boxes
+        keypoints = results.keypoints
+        
+        if boxes is None or boxes.id is None:
+            self.primary_target = None
+            return []
+
         # --- 1. Filter & Parse ---
-        for t in tracks:
+        for i, box in enumerate(boxes):
             # Check Class (Strict Person Only)
-            cls_id = int(t.cls[0])
+            cls_id = int(box.cls[0])
             if cls_id != 0: 
                 continue 
             
             # Check Safety
-            box = t.xyxy[0].cpu().numpy()
-            if self.is_safe(box): 
+            xyxy = box.xyxy[0].cpu().numpy()
+            if self.is_safe(xyxy): 
                 continue
             
-            valid_targets.append(t)
+            # Extract ID
+            tid = int(box.id[0]) if box.id is not None else -1
+            
+            # --- PRECISE TARGETING LOGIC (Keypoints) ---
+            x1, y1, x2, y2 = map(int, xyxy)
+            aim_x, aim_y = (x1 + x2) // 2, (y1 + y2) // 2 # Default to center
+            
+            if keypoints is not None and len(keypoints) > i:
+                # Keypoints for this person
+                kps = keypoints[i].xy[0].cpu().numpy() # Shape (17, 2)
+                # Kps: 0=Nose, 5=LSh, 6=RSh, 11=LHip, 12=RHip, 13=LKnee, 14=RKnee
+                
+                # Check confidence of relevant keypoints (simplified: if not [0,0])
+                def is_valid(kp_idx):
+                    return kps.shape[0] > kp_idx and kps[kp_idx][0] != 0 and kps[kp_idx][1] != 0
+
+                if aim_mode == 1: # HEAD
+                    if is_valid(0): # Nose
+                        aim_x, aim_y = kps[0]
+                    elif is_valid(1) and is_valid(2): # Midpoint Eyes
+                        aim_x = (kps[1][0] + kps[2][0]) / 2
+                        aim_y = (kps[1][1] + kps[2][1]) / 2
+                    else:
+                        # Fallback
+                        h = y2 - y1
+                        aim_y = y1 + (h * 0.12)
+
+                elif aim_mode == 3: # NON_LETHAL (Legs)
+                    if is_valid(13) and is_valid(14): # Knees Midpoint
+                        aim_x = (kps[13][0] + kps[14][0]) / 2
+                        aim_y = (kps[13][1] + kps[14][1]) / 2
+                    elif is_valid(11) and is_valid(12): # Hips (aim lower than hips)
+                        mid_x = (kps[11][0] + kps[12][0]) / 2
+                        mid_y = (kps[11][1] + kps[12][1]) / 2
+                        aim_x = mid_x
+                        aim_y = mid_y + (y2 - mid_y) * 0.5 # Halfway from hips to feet
+                    else:
+                        # Fallback
+                        h = y2 - y1
+                        aim_y = y1 + (h * 0.75)
+
+                else: # UPPER_BODY
+                    if is_valid(5) and is_valid(6): # Shoulders Midpoint
+                        aim_x = (kps[5][0] + kps[6][0]) / 2
+                        aim_y = (kps[5][1] + kps[6][1]) / 2
+                        # Adjust slightly down for chest center
+                        aim_y += (y2 - y1) * 0.05 
+                    else:
+                        # Fallback
+                        h = y2 - y1
+                        aim_y = y1 + (h * 0.35)
+
+            # Store Data
+            target_data = {
+                'id': tid,
+                'box': (x1, y1, x2, y2),
+                'center': ((x1+x2)//2, (y1+y2)//2), # Box Center
+                'aim_point': (int(aim_x), int(aim_y)), # Precise Aim Point
+                'dist_to_center': np.sqrt(((x1+x2)//2 - self.cx)**2 + ((y1+y2)//2 - self.cy)**2),
+                'locked': False
+            }
+            valid_targets.append(target_data)
 
         # --- 2. Select Primary (Strategy: Closest to Center) ---
         best_dist = float('inf')
         best_t_data = None
         
-        formatted_targets = []
-        
         for t in valid_targets:
-            box = t.xyxy[0].cpu().numpy()
-            tid = int(t.id[0]) if t.id is not None else -1
-            
-            x1, y1, x2, y2 = map(int, box)
-            tcx = (x1 + x2) // 2
-            tcy = (y1 + y2) // 2
-            
-            dist = np.sqrt((tcx - self.cx)**2 + (tcy - self.cy)**2)
-            
-            # Target Data Structure
-            target_data = {
-                'id': tid,
-                'box': (x1, y1, x2, y2),
-                'center': (tcx, tcy),
-                'dist': dist,
-                'locked': False
-            }
-            
-            # Selection Logic
-            if dist < best_dist:
-                best_dist = dist
-                best_t_data = target_data
-            
-            formatted_targets.append(target_data)
-
+            if t['dist_to_center'] < best_dist:
+                best_dist = t['dist_to_center']
+                best_t_data = t
+        
         # --- 3. Update State ---
         if best_t_data:
             self.primary_target = best_t_data
-            # Auto-lock logic: If closest, it becomes locked
             self.locked_ids.add(best_t_data['id'])
         else:
             self.primary_target = None
 
         # Sync 'locked' status
-        for ft in formatted_targets:
+        for ft in valid_targets:
             if ft['id'] in self.locked_ids:
                 ft['locked'] = True
                 
-        return formatted_targets
+        return valid_targets
 
 def draw_hud(frame, turret, targets, primary, aim_mode_idx):
     H, W = frame.shape[:2]
@@ -189,14 +234,11 @@ def draw_hud(frame, turret, targets, primary, aim_mode_idx):
         x2 = int(zone[2] * W)
         y2 = int(zone[3] * H)
         
-        # Transparent Overlay
         overlay = frame.copy()
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 50), -1) # Dark Red
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 50), -1) 
         cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
-        
-        # Border + Text
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 1)
-        cv2.putText(frame, "SAFE ZONE - NO TRACK", (x1+10, y1+25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        cv2.putText(frame, "SAFE ZONE", (x1+10, y1+25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
     # --- 2. Turret Crosshair ---
     color_cross = (0, 255, 0) if primary is None else (0, 0, 255)
@@ -204,32 +246,34 @@ def draw_hud(frame, turret, targets, primary, aim_mode_idx):
     cv2.line(frame, (cx - 25, cy), (cx + 25, cy), color_cross, 1)
     cv2.line(frame, (cx, cy - 25), (cx, cy + 25), color_cross, 1)
 
-    # --- 3. Targets ---
+    # --- 3. Targets (ALL) ---
     for t in targets:
         x1, y1, x2, y2 = t['box']
         
-        if t['locked']:
-            color = (0, 0, 255) # Red for Locked
+        if t['locked'] and t == primary:
+            color = (0, 0, 255) 
             thick = 2
-            # Connect to center
-            cv2.line(frame, (cx, cy), t['center'], color, 1)
+            # Line to Aim Point
+            cv2.line(frame, (cx, cy), t['aim_point'], color, 1)
         else:
-            color = (0, 255, 255) # Yellow for Tracked
+            color = (0, 255, 255) 
             thick = 1
             
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
         cv2.putText(frame, f"ID:{t['id']}", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+        
+        # Visualize Aim Point for EVERYONE
+        ax, ay = t['aim_point']
+        cv2.circle(frame, (ax, ay), 4, (0, 0, 255), -1)
 
     # --- 4. System Info Panel ---
-    # Background
-    panel_w, panel_h = 240, 180 # Increased height for MODE
+    panel_w, panel_h = 240, 180 
     panel_x = W - panel_w - 10
     panel_y = 10
     
     cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (0, 0, 0), -1)
     cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (0, 255, 0), 1)
     
-    # Text
     sx = panel_x + 10
     sy = panel_y + 25
     line_h = 20
@@ -257,10 +301,9 @@ def draw_hud(frame, turret, targets, primary, aim_mode_idx):
 def main():
     print("[SYSTEM] Initializing Safe Turret System...")
     
-    # Load Model (Ensure you have ultralytics installed)
-    # Using 'yolo11n.pt' as standard nano model, but variable name implies 12 capability
+    # Load POSE Model for precise keypoint targeting
     try:
-        model = YOLO("yolo11n.pt") 
+        model = YOLO("yolo11n-pose.pt") 
     except Exception as e:
         print(f"[ERROR] Model load failed: {e}")
         return
@@ -284,7 +327,7 @@ def main():
     aim_mode = 2 # Default: UPPER_BODY
     
     print(f"[SYSTEM] Cam: {W}x{H}")
-    print("[SYSTEM] Mode: SAFE HUMAN TRACKING (PASSIVE)")
+    print("[SYSTEM] Mode: PRECISE POSE TRACKING")
     print("[CONTROL] Keys: '1'=Head, '2'=Upper Body, '3'=Non-Lethal (Legs)")
 
     while True:
@@ -292,53 +335,28 @@ def main():
         if not ret: break
 
         # Track with ByteTrack for ID consistency
-        # classes=[0] enforces Person only filter at the model level
+        # classes=[0] enforces Person only filter
         results = model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False, classes=[0])
         
         # --- LOGIC UPDATE ---
         targets = []
         primary = None
         
-        if results and results[0].boxes.id is not None:
-             # Pass the Boxes object to manager
-            targets = manager.select_targets(results[0].boxes)
+        if results:
+             # Pass the FULL results object (contains keypoints)
+            targets = manager.select_targets(results[0], aim_mode)
             primary = manager.primary_target
 
         # --- TURRET PID UPDATE ---
         if primary:
-            # Calculate Aim Point based on Mode
-            x1, y1, x2, y2 = primary['box']
-            h = y2 - y1
+            # Use the calculated AIM POINT
+            target_x, target_y = primary['aim_point']
             
-            # Default Center X
-            # (If we wanted to target left/right arm, we'd adjust X too)
-            target_x = primary['center'][0]
-            
-            # Adjust Y based on Priority Mode
-            if aim_mode == 1: # HEAD
-                # Head is roughly top 15%
-                target_y = y1 + (h * 0.12)
-            elif aim_mode == 3: # NON_LETHAL (Legs/Lower)
-                # Lower body/Legs roughly bottom 25%
-                target_y = y1 + (h * 0.75)
-            else: # 2 or default: UPPER_BODY
-                # Upper Chest/Torso roughly 35% down
-                target_y = y1 + (h * 0.35)
-
             # Error = Target Point - Frame Center
             error_x = target_x - (W // 2)
             error_y = target_y - (H // 2)
             turret.update(error_x, error_y)
-            
-            # Visualize Tracking Point (The Red Dot)
-            cv2.circle(frame, (int(target_x), int(target_y)), 6, (0, 0, 255), -1)
-            cv2.circle(frame, (int(target_x), int(target_y)), 8, (0, 255, 255), 1)
-
-        else:
-            # If no target, maybe drift back to 0? Or just stay.
-            # turret.update(0, 0) # Uncomment to auto-center when idle
-            pass
-
+        
         # --- RENDER ---
         draw_hud(frame, turret, targets, primary, aim_mode)
 
