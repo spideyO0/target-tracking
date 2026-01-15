@@ -184,49 +184,57 @@ class IdentityManager:
             cached_pid = self.session_map[yolo_id]
             if cached_pid < 1000:
                 return cached_pid
-            # If cached_pid >= 1000, it's temporary. Fall through to try Face Rec again.
             
         # 2. Slow Path: Face Recognition
         encoding, face_crop = self.get_face_encoding_and_crop(frame, keypoints, person_box)
         
         if encoding is not None:
             best_match_pid = None
+            min_dist = 1.0 # Start high (0.0 is exact match)
+            tolerance = 0.50 # Strict tolerance
             
-            # Search Database
-            # Use stricter tolerance (default 0.6 -> 0.5 or 0.45) to avoid "Same ID for everyone"
-            tolerance = 0.5 
+            best_record = None
             
+            # Search Database for the BEST match, not just the first one
             for record in self.database:
-                matches = face_recognition.compare_faces(record['encodings'], encoding, tolerance=tolerance)
+                # face_distance returns array of distances to all encodings in the list
+                dists = face_recognition.face_distance(record['encodings'], encoding)
+                score = np.min(dists) # Best score for this person
                 
-                # Check for majority vote or strong match?
-                # Simple boolean match for now
-                if True in matches:
-                    best_match_pid = record['pid']
-                    
-                    if len(record['encodings']) < 50:
-                        record['encodings'].append(encoding)
-                        
-                        if 'image_paths' not in record:
-                            record['image_paths'] = []
-                        if len(record['image_paths']) < 10:
-                            filename = f"data/faces/images/pid_{best_match_pid}_{int(time.time()*1000)}.jpg"
-                            cv2.imwrite(filename, face_crop)
-                            record['image_paths'].append(filename)
-                        
-                        self.save_database()
-                    break
+                if score < min_dist:
+                    min_dist = score
+                    if min_dist < tolerance:
+                        best_match_pid = record['pid']
+                        best_record = record
             
-            if best_match_pid:
+            # Process Result
+            if best_match_pid and best_record:
+                # Matched existing
                 self.session_map[yolo_id] = best_match_pid
+                
+                # Update Record (Improve data)
+                if len(best_record['encodings']) < 50:
+                    best_record['encodings'].append(encoding)
+                    
+                    if 'image_paths' not in best_record:
+                        best_record['image_paths'] = []
+                        
+                    if len(best_record['image_paths']) < 10:
+                        filename = f"data/faces/images/pid_{best_match_pid}_{int(time.time()*1000)}.jpg"
+                        cv2.imwrite(filename, face_crop)
+                        best_record['image_paths'].append(filename)
+                        print(f"[SYSTEM] Updated PID {best_match_pid} with new face data.")
+                    
+                    self.save_database()
                 return best_match_pid
             else:
-                # Create New Identity
+                # No match found -> Create New Identity
                 new_pid = self.next_pid
                 self.next_pid += 1
                 
                 filename = f"data/faces/images/pid_{new_pid}_{int(time.time()*1000)}.jpg"
                 cv2.imwrite(filename, face_crop)
+                print(f"[SYSTEM] Saved new face image: {filename}")
                 
                 new_record = {
                     'pid': new_pid, 
@@ -242,11 +250,9 @@ class IdentityManager:
                 return new_pid
         
         # 3. Fallback: Temporary Session ID
-        # If we failed to get a face, and we already have a temp ID, return it.
         if yolo_id in self.session_map:
              return self.session_map[yolo_id]
              
-        # Otherwise assign new temp
         temp_pid = 1000 + yolo_id 
         self.session_map[yolo_id] = temp_pid
         return temp_pid
