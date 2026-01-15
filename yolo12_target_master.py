@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 import time
+import os
+import pickle
 try:
     from ultralytics import YOLO
 except ImportError:
@@ -40,13 +42,46 @@ AIM_MODES = {
     3: "NON_LETHAL"
 }
 
+DB_PATH = "data/faces/identity_db.pkl"
+
 class IdentityManager:
     def __init__(self):
-        self.database = [] # List of {'pid': int, 'encodings': [np.array]}
+        # Database Schema: 
+        # { 'pid': int, 'encodings': [list of encodings], 'last_seen': timestamp }
+        self.database = [] 
         self.next_pid = 1
         
         # Cache: Map YOLO_ID (current session) -> Persistent_ID
         self.session_map = {} 
+        
+        self.load_database()
+
+    def load_database(self):
+        if os.path.exists(DB_PATH):
+            try:
+                with open(DB_PATH, 'rb') as f:
+                    data = pickle.load(f)
+                    self.database = data.get('database', [])
+                    self.next_pid = data.get('next_pid', 1)
+                print(f"[SYSTEM] Loaded {len(self.database)} identities from {DB_PATH}")
+            except Exception as e:
+                print(f"[ERROR] Failed to load database: {e}")
+        else:
+            print("[SYSTEM] No existing database found. Starting fresh.")
+
+    def save_database(self):
+        # Create directory if not exists
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        try:
+            with open(DB_PATH, 'wb') as f:
+                data = {
+                    'database': self.database,
+                    'next_pid': self.next_pid
+                }
+                pickle.dump(data, f)
+            # print("[SYSTEM] Database saved.") # Too verbose for loop
+        except Exception as e:
+            print(f"[ERROR] Failed to save database: {e}")
 
     def get_face_encoding(self, frame, kps):
         if not FACE_REC_AVAILABLE:
@@ -93,31 +128,43 @@ class IdentityManager:
         return None
 
     def resolve_identity(self, frame, yolo_id, keypoints):
+        # 1. Fast Path: Session Cache
         if yolo_id in self.session_map:
             return self.session_map[yolo_id]
             
+        # 2. Slow Path: Face Recognition
         encoding = self.get_face_encoding(frame, keypoints)
         
         if encoding is not None:
             best_match_pid = None
             
+            # Search Database
             for record in self.database:
                 matches = face_recognition.compare_faces(record['encodings'], encoding, tolerance=0.6)
                 if True in matches:
                     best_match_pid = record['pid']
-                    record['encodings'].append(encoding)
+                    # Add new sample to robustness (limit to 50 samples)
+                    if len(record['encodings']) < 50:
+                        record['encodings'].append(encoding)
+                        self.save_database() # Auto-save on update
                     break
             
             if best_match_pid:
                 self.session_map[yolo_id] = best_match_pid
                 return best_match_pid
             else:
+                # Create New Identity
                 new_pid = self.next_pid
                 self.next_pid += 1
-                self.database.append({'pid': new_pid, 'encodings': [encoding]})
+                
+                # Save first face image (Optional: Save to disk for debug)
+                # For now just storing encoding
+                self.database.append({'pid': new_pid, 'encodings': [encoding], 'created_at': time.time()})
                 self.session_map[yolo_id] = new_pid
+                self.save_database() # Auto-save on creation
                 return new_pid
         
+        # 3. Fallback: Temporary Session ID
         temp_pid = 1000 + yolo_id 
         self.session_map[yolo_id] = temp_pid
         return temp_pid
@@ -158,7 +205,8 @@ class TargetManager:
         self.locked_ids = set() # Set of PIDs
         self.primary_target = None
         
-        self.manual_mode = False
+        # DEFAULT MODE: Manual
+        self.manual_mode = True 
         self.selected_pid = None # We now select by Persistent ID
         
         self.identity_manager = IdentityManager()
@@ -245,12 +293,14 @@ class TargetManager:
 
         best_t_data = None
         
+        # In Manual Mode (Default), we ONLY lock if selected_pid is set
         if self.selected_pid is not None:
             for t in valid_targets:
                 if t['pid'] == self.selected_pid:
                     best_t_data = t
                     break
         
+        # Auto-Fallthrough only if Manual Mode is OFF (Which it isn't by default now)
         if best_t_data is None and not self.manual_mode:
             best_dist = float('inf')
             for t in valid_targets:
@@ -417,17 +467,26 @@ def main():
                 manager.selected_pid = manager.primary_target['pid']
         elif key == ord('r'):
              manager.selected_pid = None
-             manager.manual_mode = False
+             manager.manual_mode = True # Default to Manual when reset (or False? User said default is Manual)
+             # User said: "default target mode should be manual"
+             # So reset probably just clears selection but keeps manual mode?
         elif key == 9: #TAB
             if len(targets) > 0:
                 pids = sorted([t['pid'] for t in targets])
-                if manager.selected_pid in pids:
+                
+                # If nothing selected, select first
+                if manager.selected_pid is None:
+                     manager.selected_pid = pids[0]
+                elif manager.selected_pid in pids:
+                    # Cycle
                     idx = pids.index(manager.selected_pid)
                     manager.selected_pid = pids[(idx + 1) % len(pids)]
-                    manager.manual_mode = True # Switching implies manual intent
                 else:
+                    # Current selection lost/not in frame, start at 0
                     manager.selected_pid = pids[0]
-                    manager.manual_mode = True
+                
+                # Cycling implies manual intent
+                manager.manual_mode = True 
 
     cap.release()
     cv2.destroyAllWindows()
